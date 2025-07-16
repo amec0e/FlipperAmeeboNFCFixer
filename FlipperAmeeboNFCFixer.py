@@ -40,7 +40,7 @@ def backup_file(filepath, backup_folder):
         return None
 
 def extract_pages_from_nfc(filepath):
-    """Extract all pages from .nfc file"""
+    """Extract pages 0, 1, 2, 133, 134 from .nfc file"""
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -62,7 +62,7 @@ def extract_pages_from_nfc(filepath):
         return None, None, None
 
 def calculate_password_from_uid(uid_bytes):
-    """Calculate password from UID bytes"""
+    """Calculate expected password from UID"""
     if len(uid_bytes) < 7:
         return None
     
@@ -74,7 +74,7 @@ def calculate_password_from_uid(uid_bytes):
     pwd.append(sn3 ^ sn5 ^ 0xAA)  # SN3 ^ SN5 ^ 0xAA
     pwd.append(sn4 ^ sn6 ^ 0x55)  # SN4 ^ SN6 ^ 0x55
     
-    return pwd
+    return bytes(pwd)
 
 def generate_new_uid():
     """Generate a new valid UID that doesn't have 0x88 in SN3 position"""
@@ -93,90 +93,127 @@ def generate_new_uid():
     
     return uid_bytes
 
-def analyze_nfc_file(filepath, fix_uid=True, fix_bcc=True, fix_password=True, fix_pack=True):
-    """Analyze NFC file and return what would be fixed"""
-    pages, original_content, lines = extract_pages_from_nfc(filepath)
+def validate_bcc_calculations(pages):
+    """Validate both BCC0 and BCC1 calculations"""
+    if not pages or 0 not in pages or 1 not in pages or 2 not in pages:
+        return False, "Missing pages", False, False
     
-    if not pages:
-        return False, "Could not read file", {}
+    page0 = bytes.fromhex(pages[0])  # SN0 SN1 SN2 BCC0
+    page1 = bytes.fromhex(pages[1])  # SN3 SN4 SN5 SN6
+    page2 = bytes.fromhex(pages[2])  # BCC1 INT LCK LCK
     
-    # Check if we have required pages
-    if 0 not in pages or 1 not in pages:
-        return False, "Missing required pages 0 or 1", {}
+    if len(page0) < 4 or len(page1) < 4 or len(page2) < 1:
+        return False, "Invalid page lengths", False, False
     
-    issues_found = []
-    issue_types = {
-        'sn3': False,
-        'bcc0': False,
-        'bcc1': False,
-        'password': False,
-        'pack': False
+    # Extract values
+    sn0, sn1, sn2, bcc0_actual = page0[0], page0[1], page0[2], page0[3]
+    sn3, sn4, sn5, sn6 = page1[0], page1[1], page1[2], page1[3]
+    bcc1_actual = page2[0]
+    
+    # Calculate expected BCC values
+    ct = 0x88  # Cascade Tag for NTAG215
+    bcc0_expected = ct ^ sn0 ^ sn1 ^ sn2
+    bcc1_expected = sn3 ^ sn4 ^ sn5 ^ sn6
+    
+    # Check both BCC values
+    bcc0_valid = bcc0_actual == bcc0_expected
+    bcc1_valid = bcc1_actual == bcc1_expected
+    
+    if bcc0_valid and bcc1_valid:
+        return True, f"BCC0=0x{bcc0_actual:02X} ✓, BCC1=0x{bcc1_actual:02X} ✓", True, True
+    elif bcc0_valid and not bcc1_valid:
+        return False, f"BCC0=0x{bcc0_actual:02X} ✓, BCC1=0x{bcc1_actual:02X} ✗ (expected 0x{bcc1_expected:02X})", True, False
+    elif not bcc0_valid and bcc1_valid:
+        return False, f"BCC0=0x{bcc0_actual:02X} ✗ (expected 0x{bcc0_expected:02X}), BCC1=0x{bcc1_actual:02X} ✓", False, True
+    else:
+        return False, f"BCC0=0x{bcc0_actual:02X} ✗ (expected 0x{bcc0_expected:02X}), BCC1=0x{bcc1_actual:02X} ✗ (expected 0x{bcc1_expected:02X})", False, False
+
+def validate_password_and_pack(pages):
+    """Validate password and PACK"""
+    if not pages or 0 not in pages or 1 not in pages or 133 not in pages or 134 not in pages:
+        return False, "Missing password/PACK pages", False, False
+    
+    page0 = bytes.fromhex(pages[0])  # SN0 SN1 SN2 BCC0
+    page1 = bytes.fromhex(pages[1])  # SN3 SN4 SN5 SN6
+    page133 = bytes.fromhex(pages[133])  # Password
+    page134 = bytes.fromhex(pages[134])  # PACK
+    
+    if len(page0) < 4 or len(page1) < 4 or len(page133) < 4 or len(page134) < 4:
+        return False, "Invalid page lengths", False, False
+    
+    # Build UID from pages
+    uid = page0[:3] + page1[:4]  # SN0 SN1 SN2 + SN3 SN4 SN5 SN6
+    
+    # Calculate expected password
+    expected_password = calculate_password_from_uid(uid)
+    actual_password = page133[:4]  # First 4 bytes of page 133
+    
+    # Check PACK (should always be 80 80 00 00)
+    expected_pack = bytes([0x80, 0x80, 0x00, 0x00])
+    actual_pack = page134[:4]  # First 4 bytes of page 134
+    
+    password_valid = actual_password == expected_password
+    pack_valid = actual_pack == expected_pack
+    
+    password_hex = ' '.join(f'{b:02X}' for b in actual_password)
+    expected_password_hex = ' '.join(f'{b:02X}' for b in expected_password)
+    pack_hex = ' '.join(f'{b:02X}' for b in actual_pack)
+    
+    if password_valid and pack_valid:
+        return True, f"PWD={password_hex} ✓, PACK={pack_hex} ✓", True, True
+    elif password_valid and not pack_valid:
+        return False, f"PWD={password_hex} ✓, PACK={pack_hex} ✗ (expected 80 80 00 00)", True, False
+    elif not password_valid and pack_valid:
+        return False, f"PWD={password_hex} ✗ (expected {expected_password_hex}), PACK={pack_hex} ✓", False, True
+    else:
+        return False, f"PWD={password_hex} ✗ (expected {expected_password_hex}), PACK={pack_hex} ✗ (expected 80 80 00 00)", False, False
+
+def check_uid_comprehensive(pages, filepath):
+    """Comprehensive UID validation: 4th position, BCC, password, and PACK"""
+    if not pages or 0 not in pages or 1 not in pages:
+        return False, "Missing required pages", "", {"sn3": False, "bcc0": False, "bcc1": False, "password": False, "pack": False}
+    
+    # Build UID from pages
+    page0 = bytes.fromhex(pages[0])
+    page1 = bytes.fromhex(pages[1])
+    uid = page0[:3] + page1[:4]  # SN0 SN1 SN2 + SN3 SN4 SN5 SN6
+    
+    if len(uid) < 7:
+        return False, "Invalid UID length", "", {"sn3": False, "bcc0": False, "bcc1": False, "password": False, "pack": False}
+    
+    # Check 4th byte (SN3 - first byte of page 1)
+    sn3 = uid[3]  # This is SN3
+    uid_hex = ' '.join(f'{b:02X}' for b in uid)
+    
+    # Validate BCC calculations
+    bcc_valid, bcc_msg, bcc0_valid, bcc1_valid = validate_bcc_calculations(pages)
+    
+    # Validate password and PACK
+    pwd_pack_valid, pwd_pack_msg, password_valid, pack_valid = validate_password_and_pack(pages)
+    
+    # Check 4th position issue (SN3 = 0x88)
+    has_position_issue = sn3 == 0x88
+    sn3_valid = not has_position_issue
+    
+    # Determine overall status
+    all_valid = sn3_valid and bcc_valid and pwd_pack_valid
+    
+    if has_position_issue:
+        sn3_status = f"SN3=0x88 (PROBLEM!)"
+    else:
+        sn3_status = f"SN3=0x{sn3:02X} (OK)"
+    
+    status = f"{sn3_status} + {bcc_msg} + {pwd_pack_msg}"
+    
+    problem_details = {
+        "sn3": sn3_valid,
+        "bcc0": bcc0_valid,
+        "bcc1": bcc1_valid,
+        "password": password_valid,
+        "pack": pack_valid
     }
     
-    # Extract current UID structure
-    page0_hex = pages[0]
-    page1_hex = pages[1]
-    
-    if len(page0_hex) < 8 or len(page1_hex) < 8:
-        return False, "Invalid page format", {}
-    
-    # Convert to bytes for easier manipulation
-    page0_bytes = bytes.fromhex(page0_hex)
-    page1_bytes = bytes.fromhex(page1_hex)
-    
-    sn0, sn1, sn2, current_bcc0 = page0_bytes[0], page0_bytes[1], page0_bytes[2], page0_bytes[3]
-    sn3, sn4, sn5, sn6 = page1_bytes[0], page1_bytes[1], page1_bytes[2], page1_bytes[3]
-    
-    # Check if UID needs fixing (SN3 = 0x88)
-    if fix_uid and sn3 == 0x88:
-        issues_found.append("UID: SN3=0x88 (would generate new UID)")
-        issue_types['sn3'] = True
-    
-    # Calculate correct BCC values
-    ct = 0x88
-    correct_bcc0 = ct ^ sn0 ^ sn1 ^ sn2
-    correct_bcc1 = sn3 ^ sn4 ^ sn5 ^ sn6
-    
-    # Check BCC0
-    if fix_bcc and current_bcc0 != correct_bcc0:
-        issues_found.append(f"BCC0: {current_bcc0:02X} -> {correct_bcc0:02X}")
-        issue_types['bcc0'] = True
-    
-    # Check BCC1
-    if fix_bcc and 2 in pages:
-        page2_bytes = bytes.fromhex(pages[2])
-        if len(page2_bytes) >= 1:
-            current_bcc1 = page2_bytes[0]
-            if current_bcc1 != correct_bcc1:
-                issues_found.append(f"BCC1: {current_bcc1:02X} -> {correct_bcc1:02X}")
-                issue_types['bcc1'] = True
-    
-    # Check password
-    if fix_password and 133 in pages:
-        uid_bytes = [sn0, sn1, sn2, sn3, sn4, sn5, sn6]
-        correct_password = calculate_password_from_uid(uid_bytes)
-        page133_bytes = bytes.fromhex(pages[133])
-        if len(page133_bytes) >= 4:
-            current_password = list(page133_bytes[:4])
-            if current_password != correct_password:
-                pwd_old = ' '.join(f'{b:02X}' for b in current_password)
-                pwd_new = ' '.join(f'{b:02X}' for b in correct_password)
-                issues_found.append(f"Password: {pwd_old} -> {pwd_new}")
-                issue_types['password'] = True
-    
-    # Check PACK
-    if fix_pack and 134 in pages:
-        correct_pack = [0x80, 0x80, 0x00, 0x00]
-        page134_bytes = bytes.fromhex(pages[134])
-        if len(page134_bytes) >= 4:
-            current_pack = list(page134_bytes[:4])
-            if current_pack != correct_pack:
-                pack_old = ' '.join(f'{b:02X}' for b in current_pack)
-                pack_new = ' '.join(f'{b:02X}' for b in correct_pack)
-                issues_found.append(f"PACK: {pack_old} -> {pack_new}")
-                issue_types['pack'] = True
-    
-    return True, issues_found, issue_types
+    return all_valid, status, uid_hex, problem_details
 
 def fix_nfc_file(filepath, backup_folder, fix_uid=True, fix_bcc=True, fix_password=True, fix_pack=True):
     """Fix all issues in an NFC file"""
@@ -241,7 +278,7 @@ def fix_nfc_file(filepath, backup_folder, fix_uid=True, fix_bcc=True, fix_passwo
     
     # Calculate correct password
     uid_bytes = [sn0, sn1, sn2, sn3, sn4, sn5, sn6]
-    correct_password = calculate_password_from_uid(uid_bytes)
+    correct_password = list(calculate_password_from_uid(uid_bytes))
     
     # Fix password if needed
     if fix_password and 133 in pages:
@@ -338,125 +375,152 @@ def scan_and_fix_directory(directory, fix_uid=True, fix_bcc=True, fix_password=T
     backup_folder = None
     if not dry_run:
         backup_folder = create_backup_folder(directory)
-        print(f"📁 Backup folder created: {backup_folder.name}\n")
+        backup_full_path = backup_folder.resolve()
     
     all_files = []
-    unsupported_files = defaultdict(int)  # Track unsupported file types
-    issue_stats = {
-        'sn3': 0,
-        'bcc0': 0,
-        'bcc1': 0,
-        'password': 0,
-        'pack': 0
-    }
+    unsupported_files = defaultdict(int)
     
-    # Find all .nfc and .bin files, but handle them differently
+    # Find all .nfc and .bin files
     for ext in ['*.nfc', '*.bin']:
         for filepath in directory.rglob(ext):
             if filepath.suffix.lower() == '.nfc':
-                if dry_run:
-                    # In dry run, analyze what would be fixed
-                    success, issues, issue_types = analyze_nfc_file(filepath, fix_uid, fix_bcc, fix_password, fix_pack)
-                    if success:
-                        if issues:
-                            message = f"Would fix: {'; '.join(issues)}"
-                            # Count issue types
-                            for issue_type, has_issue in issue_types.items():
-                                if has_issue:
-                                    issue_stats[issue_type] += 1
-                        else:
-                            message = "No issues found"
-                    else:
-                        message = issues  # This would be the error message
-                else:
-                    # Actually fix the file
-                    success, message, issue_types = fix_nfc_file(filepath, backup_folder, fix_uid, fix_bcc, fix_password, fix_pack)
-                    if success and issue_types:
-                        # Count issue types that were fixed
-                        for issue_type, has_issue in issue_types.items():
-                            if has_issue:
-                                issue_stats[issue_type] += 1
+                pages, _, _ = extract_pages_from_nfc(filepath)
+                is_valid, status, uid_hex, problem_details = check_uid_comprehensive(pages, filepath.relative_to(directory))
                 
-                all_files.append({
-                    'path': filepath.relative_to(directory),
-                    'success': success,
-                    'message': message,
-                    'needs_fixing': success and (("Would fix:" in message) if dry_run else ("Fixed" in message))
-                })
+                if dry_run:
+                    # In dry run mode, just show original status
+                    all_files.append({
+                        'path': filepath.relative_to(directory),
+                        'is_valid': is_valid,
+                        'status': status,
+                        'uid_hex': uid_hex,
+                        'problems': problem_details,
+                        'was_fixed': False
+                    })
+                else:
+                    # Store original status
+                    original_status = status
+                    original_valid = is_valid
+                    
+                    # Actually fix the file if it has problems
+                    was_fixed = False
+                    if not is_valid:
+                        success, message, issue_types = fix_nfc_file(filepath, backup_folder, fix_uid, fix_bcc, fix_password, fix_pack)
+                        if success and any(issue_types.values()):
+                            was_fixed = True
+                    
+                    # For display purposes, show the ORIGINAL status (what the problems were)
+                    # but mark if it was fixed
+                    all_files.append({
+                        'path': filepath.relative_to(directory),
+                        'is_valid': original_valid,
+                        'status': original_status,
+                        'uid_hex': uid_hex,
+                        'problems': problem_details,
+                        'was_fixed': was_fixed
+                    })
             
             elif filepath.suffix.lower() == '.bin':
-                # Count unsupported files by type
                 unsupported_files['.bin'] += 1
     
-    # Sort files by name
+    # Sort files by name (ascending)
     all_files.sort(key=lambda x: str(x['path']).lower())
     
-    # Separate files that need fixing from those that don't
-    needs_fixing = [f for f in all_files if f['needs_fixing']]
-    no_issues = [f for f in all_files if f['success'] and not f['needs_fixing']]
-    failed_files = [f for f in all_files if not f['success']]
+    # Separate valid and problem files based on ORIGINAL status
+    valid_files = [f for f in all_files if f['is_valid']]
+    problem_files = [f for f in all_files if not f['is_valid']]
     
-    # Display results
-    if needs_fixing:
-        print("🔧 FILES THAT NEED FIXING:" if dry_run else "🔧 FILES FIXED:")
+    # Display valid files first
+    if valid_files:
+        print("✅ VALID FILES:")
         print("-" * 70)
-        for file_info in needs_fixing:
-            print(f"🔧 {file_info['path']}: {file_info['message']}")
+        for file_info in valid_files:
+            print(f"✅ {file_info['path']}: UID {file_info['uid_hex']} - {file_info['status']}")
     
-    if no_issues:
-        if needs_fixing:
+    # Display problem files grouped together
+    if problem_files:
+        if valid_files:
             print("\n")
-        print("✅ FILES WITH NO ISSUES:")
+        if dry_run:
+            print("🚨 PROBLEM FILES:")
+        else:
+            print("🚨 PROBLEM FILES (FIXED):")
         print("-" * 70)
-        for file_info in no_issues:
-            print(f"✅ {file_info['path']}: {file_info['message']}")
+        for file_info in problem_files:
+            prefix = "🚨" if "SN3=0x88" in file_info['status'] else "⚠️ "
+            if not dry_run and file_info['was_fixed']:
+                # Show that it was fixed
+                print(f"✅ {file_info['path']}: UID {file_info['uid_hex']} - {file_info['status']} (FIXED)")
+            else:
+                print(f"{prefix} {file_info['path']}: UID {file_info['uid_hex']} - {file_info['status']}")
     
-    if failed_files:
-        if needs_fixing or no_issues:
-            print("\n")
-        print("❌ FAILED TO PROCESS:")
-        print("-" * 70)
-        for file_info in failed_files:
-            print(f"❌ {file_info['path']}: {file_info['message']}")
+    # Calculate problem statistics based on ORIGINAL problems
+    problem_stats = {
+        "sn3": 0,
+        "bcc0": 0,
+        "bcc1": 0,
+        "password": 0,
+        "pack": 0
+    }
+    
+    for file_info in problem_files:
+        problems = file_info['problems']
+        if not problems['sn3']:
+            problem_stats['sn3'] += 1
+        if not problems['bcc0']:
+            problem_stats['bcc0'] += 1
+        if not problems['bcc1']:
+            problem_stats['bcc1'] += 1
+        if not problems['password']:
+            problem_stats['password'] += 1
+        if not problems['pack']:
+            problem_stats['pack'] += 1
     
     # Summary
     total_files = len(all_files)
     unsupported_count = sum(unsupported_files.values())
-    needs_fixing_count = len(needs_fixing)
-    no_issues_count = len(no_issues)
-    failed_count = len(failed_files)
+    problem_count = len(problem_files)
+    valid_count = len(valid_files)
+    fixed_count = len([f for f in problem_files if f.get('was_fixed', False)])
     
     print(f"\n{'='*70}")
-    print(f"Analysis Complete!" if dry_run else "Processing Complete!")
-    print(f"Total .nfc files checked: {total_files}")
-    print(f"Files needing fixes: {needs_fixing_count}")
-    print(f"Files with no issues: {no_issues_count}")
-    print(f"Failed to process: {failed_count}")
+    if dry_run:
+        print(f"Scan Complete!")
+    else:
+        print(f"Processing Complete!")
+    print(f"Total files checked: {total_files}")
+    print(f"Valid files: {valid_count}")
+    print(f"Problem files: {problem_count}")
+    if not dry_run and fixed_count > 0:
+        print(f"Files fixed: {fixed_count}")
     
-    # Show unsupported files summary
     if unsupported_count > 0:
         unsupported_list = []
         for ext, count in unsupported_files.items():
             unsupported_list.append(f"{count} {ext} files")
         print(f"Unsupported files: {', '.join(unsupported_list)} (Only Flipper Zero .nfc files are supported)")
     
-    # Detailed issue breakdown
-    if needs_fixing_count > 0:
-        print(f"\n📊 DETAILED ISSUE BREAKDOWN:")
-        print(f"   SN3 (0x88 issue):     {issue_stats['sn3']} files")
-        print(f"   BCC0 incorrect:       {issue_stats['bcc0']} files")
-        print(f"   BCC1 incorrect:       {issue_stats['bcc1']} files")
-        print(f"   Password incorrect:   {issue_stats['password']} files")
-        print(f"   PACK incorrect:       {issue_stats['pack']} files")
+    if problem_count > 0:
+        print(f"\n📊 PROBLEM BREAKDOWN:")
+        print(f"   SN3 (0x88 issue):     {problem_stats['sn3']} files")
+        print(f"   BCC0 incorrect:       {problem_stats['bcc0']} files")
+        print(f"   BCC1 incorrect:       {problem_stats['bcc1']} files")
+        print(f"   Password incorrect:   {problem_stats['password']} files")
+        print(f"   PACK incorrect:       {problem_stats['pack']} files")
         
         if dry_run:
-            print(f"\n📝 {needs_fixing_count} files need fixing. Use --fix to actually modify them.")
+            print(f"\n⚠️  Found {problem_count} files with issues!")
+            print("These files may not be recognized by NFC readers.")
+            print("Use --fix to actually modify them.")
         else:
-            print(f"\n✅ {needs_fixing_count} files fixed successfully!")
-            if backup_folder:
-                print(f"📁 All original files backed up to: {backup_folder.name}")
+            if backup_folder and fixed_count > 0:
+                backup_full_path = backup_folder.resolve()
+                print(f"\n✅ {fixed_count} files have been fixed!")
+                print(f"📁 All original files backed up to: {backup_full_path}")
+            elif problem_count > 0:
+                print(f"\nℹ️  {problem_count} files had issues but no changes were made.")
     else:
-        print("\n🎉 All supported files are already valid!")
+        print("\n🎉 All files passed validation!")
 
 def main():
     import argparse
